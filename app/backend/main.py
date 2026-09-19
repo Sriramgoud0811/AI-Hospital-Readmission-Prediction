@@ -7,6 +7,7 @@ import pandas as pd
 from scipy.sparse import csr_matrix, hstack
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
@@ -29,10 +30,20 @@ logger = logging.getLogger("ai_hospital_api")
 app = FastAPI(
     title="AI Hospital Readmission & Length-of-Stay API",
     description=(
-        "Machine Learning API for Hospital Length-of-Stay "
-        "Prediction and 30-Day Hospital Readmission Risk."
+        "API for hospital length-of-stay estimation "
+        "and 30-day readmission risk assessment."
     ),
     version="1.0.0"
+)
+
+# Allow the deployed frontend to call this API from a browser.
+# For production, replace ["*"] with your exact frontend origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -40,7 +51,21 @@ app = FastAPI(
 # Project Paths
 # ============================================================
 
-APP_DIR = Path(__file__).resolve().parents[1]
+# Resolve the project root safely whether main.py is located in the
+# repository root, an app/ folder, or another one-level subfolder.
+FILE_DIR = Path(__file__).resolve().parent
+CANDIDATE_APP_DIRS = [
+    FILE_DIR,
+    FILE_DIR.parent,
+    FILE_DIR.parent.parent,
+    Path.cwd(),
+]
+
+APP_DIR = next(
+    (candidate for candidate in CANDIDATE_APP_DIRS
+     if (candidate / "pickles").is_dir()),
+    FILE_DIR.parent,
+)
 PICKLES_DIR = APP_DIR / "pickles"
 
 MODEL1_DIR = PICKLES_DIR / "model1"
@@ -105,8 +130,18 @@ artifact_errors = []
 
 def load_pickle(path: Path):
 
+    if not path.is_file():
+        raise FileNotFoundError(f"Model artifact not found: {path}")
+
     with path.open("rb") as file:
         return pickle.load(file)
+
+
+def pydantic_to_dict(data):
+    """Support both Pydantic v2 and v1 environments."""
+    if hasattr(data, "model_dump"):
+        return data.model_dump()
+    return data.dict()
 
 
 # ============================================================
@@ -270,7 +305,7 @@ def load_artifacts():
             )
 
         logger.info(
-            "Classification artifacts loaded successfully."
+            "Classification artifacts loaded successfully. Input order: 14 raw numerical + 201 OHE categorical = 215."
         )
 
     except Exception as exc:
@@ -517,7 +552,7 @@ def build_regression_model_input(
 ):
 
     df = pd.DataFrame(
-        [data.model_dump()]
+        [pydantic_to_dict(data)]
     )
 
     # Exact notebook missing handling.
@@ -598,7 +633,7 @@ def build_regression_model_input(
     # --------------------------------------------------------
 
     scaled = regression_scaler.transform(
-        numerical_data
+        numerical_data.to_numpy(dtype=np.float32)
     )
 
     # Convert both representations safely to sparse.
@@ -898,7 +933,7 @@ def build_classification_model_input(
 ):
 
     df = pd.DataFrame(
-        [data.model_dump()]
+        [pydantic_to_dict(data)]
     )
 
     # Exact notebook missing handling.
@@ -955,8 +990,9 @@ def build_classification_model_input(
 
     df["medication_burden_group"] = pd.cut(
         df["num_medications"],
+        # Include zero medications in the Low category.
         bins=[
-            0,
+            -1,
             10,
             20,
             np.inf
@@ -1063,32 +1099,32 @@ def build_classification_model_input(
     )
 
     # --------------------------------------------------------
-    # Scaling
+    # Final XGBoost input order
     # --------------------------------------------------------
-
-    scaled = classification_scaler.transform(
-        numerical_data
-    )
+    # The notebook trains the final XGBoost/Calibrated XGBoost
+    # using X_train_encoded = [raw numerical (14), OHE (201)].
+    # Do NOT scale the numerical columns here and do NOT reverse
+    # the order, otherwise the API can return a wrong prediction
+    # while still having shape (1, 215).
 
     encoded_sparse = csr_matrix(
         encoded,
         dtype=np.float32
     )
 
-    scaled_sparse = csr_matrix(
-        scaled,
-        dtype=np.float32
+    numerical_sparse = csr_matrix(
+        numerical_data.to_numpy(dtype=np.float32)
     )
 
     # --------------------------------------------------------
     # Exact final matrix:
-    # 201 + 14 = 215
+    # 14 raw numerical + 201 one-hot categorical = 215
     # --------------------------------------------------------
 
     final_matrix = hstack(
         [
-            encoded_sparse,
-            scaled_sparse
+            numerical_sparse,
+            encoded_sparse
         ],
         format="csr"
     )
